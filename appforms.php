@@ -2,20 +2,21 @@
 /**
  * Plugin Name: Trofy AppForms
  * Description: Форма регистрации экипажей, защищённый список заявок и экспорт Excel.
- * Version: 2.0.0
+ * Version: 2.0.1
  * Author: Alex7r259
  */
 
 defined('ABSPATH') || exit;
 
 final class Trofy_AppForms {
-    private const VERSION = '2.0.0';
+    private const VERSION = '2.0.1';
     private const ACCESS_TTL = 28800;
     private const ACCESS_COOKIE = 'trofy_appforms_access';
     private static $db = null;
 
     public static function init(): void {
         add_shortcode('appforms-301', [__CLASS__, 'render_application_form']);
+        add_shortcode('event_registration', [__CLASS__, 'render_application_form']);
         add_shortcode('appforms-302', [__CLASS__, 'render_applications']);
         add_filter('query_vars', static function ($vars) { $vars[] = 'season_id'; $vars[] = 'event_id'; return $vars; });
         add_action('admin_menu', [__CLASS__, 'admin_menu']);
@@ -45,13 +46,47 @@ final class Trofy_AppForms {
         return self::$db;
     }
 
+    /**
+     * Возвращает настройки события из URL, если season_id/event_id переданы.
+     * Это сохраняет привязку формы к конкретной странице события.
+     * Если параметры не переданы, используется событие из appsettings.
+     */
     private static function settings(): ?array {
+        $season_id = absint(get_query_var('season_id'));
+        $event_id = absint(get_query_var('event_id'));
+
+        if ($season_id && $event_id) {
+            $stmt = self::db()->prepare("SELECT e.event_id, e.season_id, app.pass, e.event_name, s.season_name, e.event_date FROM Events e JOIN Seasons s ON e.season_id=s.season_id LEFT JOIN appsettings app ON app.id=1 WHERE e.event_id=? AND e.season_id=? LIMIT 1");
+            $stmt->bind_param('ii', $event_id, $season_id);
+            $stmt->execute();
+            $row = $stmt->get_result()->fetch_assoc();
+            if ($row) {
+                if (empty($row['pass'])) {
+                    $fallback = self::db()->query("SELECT pass FROM appsettings WHERE id=1 LIMIT 1")->fetch_assoc();
+                    $row['pass'] = $fallback['pass'] ?? '';
+                }
+                return $row;
+            }
+        }
+
         $row = self::db()->query("SELECT app.event_id, app.season_id, app.pass, e.event_name, s.season_name, e.event_date FROM appsettings app JOIN Seasons s ON app.season_id=s.season_id JOIN Events e ON app.event_id=e.event_id ORDER BY app.id ASC LIMIT 1")->fetch_assoc();
         return $row ?: null;
     }
 
     private static function redirect(string $url, array $args = []): void { wp_safe_redirect(add_query_arg($args, $url)); exit; }
-    private static function applications_url(): string { return home_url('/заявки/'); }
+
+    private static function current_url(): string {
+        $url = home_url(wp_unslash($_SERVER['REQUEST_URI'] ?? '/'));
+        return esc_url_raw(remove_query_arg(['r','login'], $url));
+    }
+
+    private static function applications_url(?array $settings = null): string {
+        $url = home_url('/заявки/');
+        $season_id = $settings['season_id'] ?? absint(get_query_var('season_id'));
+        $event_id = $settings['event_id'] ?? absint(get_query_var('event_id'));
+        if ($season_id && $event_id) $url = add_query_arg(['season_id'=>$season_id,'event_id'=>$event_id], $url);
+        return $url;
+    }
 
     private static function has_public_access(): bool {
         if (empty($_COOKIE[self::ACCESS_COOKIE])) return false;
@@ -110,30 +145,33 @@ final class Trofy_AppForms {
 
     public static function ajax_load_events(): void { check_ajax_referer('trofy_appforms_admin','nonce'); if(!current_user_can('manage_options'))wp_send_json_error('Недостаточно прав.',403);$season_id=absint($_POST['season_id']??0);$stmt=self::db()->prepare('SELECT event_id,event_name FROM Events WHERE season_id=? ORDER BY event_date,event_id');$stmt->bind_param('i',$season_id);$stmt->execute();wp_send_json_success($stmt->get_result()->fetch_all(MYSQLI_ASSOC)); }
 
-    public static function ajax_save_settings(): void { check_ajax_referer('trofy_appforms_admin','nonce');if(!current_user_can('manage_options'))wp_send_json_error('Недостаточно прав.',403);try{$season_id=absint($_POST['season_id']??0);$event_id=absint($_POST['event_id']??0);$pass=isset($_POST['pass'])?trim(wp_unslash($_POST['pass'])):'';if(!$season_id||!$event_id)wp_send_json_error('Выберите сезон и этап.');if($pass!==''){$hash=wp_hash_password($pass);$stmt=self::db()->prepare('UPDATE appsettings SET season_id=?,event_id=?,pass=? WHERE id=1');$stmt->bind_param('iis',$season_id,$event_id,$hash);}else{$stmt=self::db()->prepare('UPDATE appsettings SET season_id=?,event_id=? WHERE id=1');$stmt->bind_param('ii',$season_id,$event_id);}$stmt->execute();wp_send_json_success('Настройки сохранены.');}catch(Throwable $e){wp_send_json_error($e->getMessage());} }
+    public static function ajax_save_settings(): void { check_ajax_referer('trofy_appforms_admin','nonce');if(!current_user_can('manage_options'))wp_send_json_error('Недостаточно прав.',403);try{$season_id=absint($_POST['season_id']??0);$event_id=absint($_POST['event_id']??0);$pass=isset($_POST['pass'])?trim(wp_unslash($_POST['pass'])):'';if(!$season_id||!$event_id)wp_send_json_error('Выберите сезон и этап.');$check=self::db()->prepare('SELECT event_id FROM Events WHERE event_id=? AND season_id=? LIMIT 1');$check->bind_param('ii',$event_id,$season_id);$check->execute();if(!$check->get_result()->fetch_assoc())wp_send_json_error('Выбранный этап не относится к выбранному сезону.');if($pass!==''){$hash=wp_hash_password($pass);$stmt=self::db()->prepare('UPDATE appsettings SET season_id=?,event_id=?,pass=? WHERE id=1');$stmt->bind_param('iis',$season_id,$event_id,$hash);}else{$stmt=self::db()->prepare('UPDATE appsettings SET season_id=?,event_id=? WHERE id=1');$stmt->bind_param('ii',$season_id,$event_id);}$stmt->execute();wp_send_json_success('Настройки сохранены.');}catch(Throwable $e){wp_send_json_error($e->getMessage());} }
 
     public static function ajax_delete_application(): void { check_ajax_referer('trofy_appforms_admin','nonce');if(!current_user_can('manage_options'))wp_send_json_error('Недостаточно прав.',403);$id=absint($_POST['id']??0);if(!$id)wp_send_json_error('Некорректная заявка.');$stmt=self::db()->prepare('DELETE FROM appparticipation WHERE id=?');$stmt->bind_param('i',$id);$stmt->execute();wp_send_json_success(); }
 
     public static function render_application_form(): string {
         try{$settings=self::settings();}catch(Throwable $e){return '<div class="trofy-alert">Ошибка подключения к заявкам.</div>';}
-        if(!$settings)return '<div class="trofy-alert">Не удалось загрузить настройки мероприятия.</div>';$deadline=new DateTime($settings['event_date']);$deadline->modify('-17 hours');if(new DateTime()>=$deadline)return '<div class="trofy-closed"><h3>Приём заявок окончен</h3><p>Список заявок доступен на отдельной странице.</p></div>';
-        ob_start();?><div class="trofy-form"><div class="trofy-form-head"><span>РЕГИСТРАЦИЯ</span><h2><?php echo esc_html($settings['event_name']); ?></h2><p><?php echo esc_html($settings['season_name']); ?></p></div><form action="<?php echo esc_url(admin_url('admin-post.php')); ?>" method="post"><input type="hidden" name="action" value="trofy_submit_application"><?php wp_nonce_field('trofy_submit_application','_wpnonce'); ?><input type="text" name="website" class="trofy-hp" tabindex="-1" autocomplete="off"><?php self::form_input('namePilot','ФИО пилота',true);self::form_input('nameShturman','ФИО штурмана');self::form_input('tel','Телефон',true,'tel');self::form_input('car','Автомобиль',true);self::form_input('city','Город',true); ?><div class="trofy-input"><label>Класс *</label><div class="trofy-radios"><?php foreach(['Полироль','Стандарт','Туризм','Спорт'] as $class): ?><label><input type="radio" name="class" value="<?php echo esc_attr($class); ?>" required><span><?php echo esc_html($class); ?></span></label><?php endforeach; ?></div></div><input type="hidden" name="season_id" value="<?php echo (int)$settings['season_id']; ?>"><input type="hidden" name="event_id" value="<?php echo (int)$settings['event_id']; ?>"><button class="trofy-submit" type="submit">Отправить заявку <span>→</span></button></form></div><?php return ob_get_clean();
+        if(!$settings)return '<div class="trofy-alert">Не удалось загрузить настройки мероприятия.</div>';$deadline=new DateTime($settings['event_date']);$deadline->modify('-17 hours');if(new DateTime()>=$deadline)return '<div class="trofy-closed"><h3>Приём заявок окончен</h3><p><a href="'.esc_url(self::applications_url($settings)).'">Список заявок</a></p></div>';
+        $redirect_to=self::current_url();
+        ob_start();?><div class="trofy-form"><div class="trofy-form-head"><span>РЕГИСТРАЦИЯ</span><h2><?php echo esc_html($settings['event_name']); ?></h2><p><?php echo esc_html($settings['season_name']); ?></p></div><form action="<?php echo esc_url(admin_url('admin-post.php')); ?>" method="post"><input type="hidden" name="action" value="trofy_submit_application"><?php wp_nonce_field('trofy_submit_application','_wpnonce'); ?><input type="hidden" name="redirect_to" value="<?php echo esc_attr($redirect_to); ?>"><input type="text" name="website" class="trofy-hp" tabindex="-1" autocomplete="off"><?php self::form_input('namePilot','ФИО пилота',true);self::form_input('nameShturman','ФИО штурмана');self::form_input('tel','Телефон',true,'tel');self::form_input('car','Автомобиль',true);self::form_input('city','Город',true); ?><div class="trofy-input"><label>Класс *</label><div class="trofy-radios"><?php foreach(['Полироль','Стандарт','Туризм','Спорт'] as $class): ?><label><input type="radio" name="class" value="<?php echo esc_attr($class); ?>" required><span><?php echo esc_html($class); ?></span></label><?php endforeach; ?></div></div><input type="hidden" name="season_id" value="<?php echo (int)$settings['season_id']; ?>"><input type="hidden" name="event_id" value="<?php echo (int)$settings['event_id']; ?>"><button class="trofy-submit" type="submit">Отправить заявку <span>→</span></button></form></div><?php return ob_get_clean();
     }
 
     private static function form_input(string $name,string $label,bool $required=false,string $type='text'):void{echo '<div class="trofy-input"><label for="trofy-'.esc_attr($name).'">'.esc_html($label).($required?' *':'').'</label><input id="trofy-'.esc_attr($name).'" type="'.esc_attr($type).'" name="'.esc_attr($name).'" maxlength="200"'.($required?' required':'').'></div>';}
 
     public static function submit_application(): void {
-        if(!isset($_POST['_wpnonce'])||!wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['_wpnonce'])),'trofy_submit_application'))self::redirect(home_url('/заявка/'),['r'=>'err']);if(!empty($_POST['website']))self::redirect(home_url('/заявка/'),['r'=>'ok']);
-        try{$fields=['namePilot','nameShturman','tel','class','car','city'];$data=[];foreach($fields as $field)$data[$field]=isset($_POST[$field])?sanitize_text_field(wp_unslash($_POST[$field])):'';$season_id=absint($_POST['season_id']??0);$event_id=absint($_POST['event_id']??0);if(!$data['namePilot']||!$data['tel']||!$data['class']||!$data['car']||!$data['city']||!$season_id||!$event_id)throw new RuntimeException('Не заполнены обязательные поля.');$stmt=self::db()->prepare('INSERT INTO appparticipation (time,namePilot,nameShturman,tel,class,car,city,season_id,event_id) VALUES (NOW(),?,?,?,?,?,?,?,?)');$stmt->bind_param('ssssssii',$data['namePilot'],$data['nameShturman'],$data['tel'],$data['class'],$data['car'],$data['city'],$season_id,$event_id);$stmt->execute();$message="Новая заявка\nПилот: {$data['namePilot']}\nШтурман: {$data['nameShturman']}\nТел.: {$data['tel']}\nКласс: {$data['class']}\nАвто: {$data['car']}\nГород: {$data['city']}";wp_mail(get_option('admin_email'),'Новая заявка',$message);self::redirect(home_url('/заявка/'),['r'=>'ok']);}catch(Throwable $e){error_log('Trofy AppForms: '.$e->getMessage());self::redirect(home_url('/заявка/'),['r'=>'err']);}
+        $redirect=!empty($_POST['redirect_to'])?esc_url_raw(wp_unslash($_POST['redirect_to'])):home_url('/заявка/');
+        if(!wp_validate_redirect($redirect,home_url('/заявка/'))) $redirect=home_url('/заявка/');
+        if(!isset($_POST['_wpnonce'])||!wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['_wpnonce'])),'trofy_submit_application'))self::redirect($redirect,['r'=>'err']);if(!empty($_POST['website']))self::redirect($redirect,['r'=>'ok']);
+        try{$fields=['namePilot','nameShturman','tel','class','car','city'];$data=[];foreach($fields as $field)$data[$field]=isset($_POST[$field])?sanitize_text_field(wp_unslash($_POST[$field])):'';$season_id=absint($_POST['season_id']??0);$event_id=absint($_POST['event_id']??0);if(!$data['namePilot']||!$data['tel']||!$data['class']||!$data['car']||!$data['city']||!$season_id||!$event_id)throw new RuntimeException('Не заполнены обязательные поля.');$check=self::db()->prepare('SELECT event_id,event_date FROM Events WHERE event_id=? AND season_id=? LIMIT 1');$check->bind_param('ii',$event_id,$season_id);$check->execute();$event=$check->get_result()->fetch_assoc();if(!$event)throw new RuntimeException('Некорректное мероприятие.');$deadline=new DateTime($event['event_date']);$deadline->modify('-17 hours');if(new DateTime()>=$deadline)throw new RuntimeException('Приём заявок окончен.');$allowed=['Полироль','Стандарт','Туризм','Спорт'];if(!in_array($data['class'],$allowed,true))throw new RuntimeException('Некорректный класс.');$stmt=self::db()->prepare('INSERT INTO appparticipation (time,namePilot,nameShturman,tel,class,car,city,season_id,event_id) VALUES (NOW(),?,?,?,?,?,?,?,?)');$stmt->bind_param('ssssssii',$data['namePilot'],$data['nameShturman'],$data['tel'],$data['class'],$data['car'],$data['city'],$season_id,$event_id);$stmt->execute();$message="Новая заявка\nПилот: {$data['namePilot']}\nШтурман: {$data['nameShturman']}\nТел.: {$data['tel']}\nКласс: {$data['class']}\nАвто: {$data['car']}\nГород: {$data['city']}";wp_mail(get_option('admin_email'),'Новая заявка',$message);self::redirect($redirect,['r'=>'ok']);}catch(Throwable $e){error_log('Trofy AppForms: '.$e->getMessage());self::redirect($redirect,['r'=>'err']);}
     }
 
     public static function render_applications(): string {
-        try{$settings=self::settings();}catch(Throwable $e){return '<div class="trofy-alert">Ошибка подключения к заявкам.</div>'; }if(!$settings)return '<div class="trofy-alert">Не удалось загрузить настройки.</div>';if(!self::has_public_access()){$error=isset($_GET['login'])?'<div class="trofy-login-error">Неверный пароль.</div>':'';return '<div class="trofy-login"><div class="trofy-login-icon">🔒</div><h2>Доступ к заявкам</h2><p>Введите пароль, чтобы посмотреть список экипажей.</p>'.$error.'<form action="'.esc_url(admin_url('admin-post.php')).'" method="post"><input type="hidden" name="action" value="trofy_public_login"><input type="hidden" name="redirect_to" value="'.esc_attr(self::applications_url()).'"><input type="password" name="password" placeholder="Пароль" autocomplete="current-password" required><button type="submit">Показать заявки</button></form></div>';}
-        $rows=self::get_applications((int)$settings['season_id'],(int)$settings['event_id']);ob_start();?><div class="trofy-public"><div class="trofy-public-head"><div><span>СПИСОК ЗАЯВОК</span><h2><?php echo esc_html($settings['event_name']); ?></h2><p><?php echo esc_html($settings['season_name']); ?></p></div><div class="trofy-public-actions"><a href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=trofy_export&scope=public'),'trofy_export')); ?>">↓ Excel</a><a href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=trofy_public_logout'),'trofy_public_logout')); ?>">Выйти</a></div></div><div class="trofy-public-count">Всего экипажей: <strong><?php echo count($rows); ?></strong></div><div class="trofy-public-grid"><?php foreach($rows as $i=>$row): ?><article><div class="trofy-card-top"><span>#<?php echo $i+1; ?></span><b><?php echo esc_html($row['class']); ?></b></div><h3><?php echo esc_html($row['namePilot']); ?></h3><p><?php echo esc_html($row['nameShturman']); ?></p><div>🚙 <?php echo esc_html($row['car']); ?></div><div>📍 <?php echo esc_html($row['city']); ?></div><div>📞 <a href="tel:<?php echo esc_attr($row['tel']); ?>"><?php echo esc_html($row['tel']); ?></a></div></article><?php endforeach; ?></div></div><?php return ob_get_clean();
+        try{$settings=self::settings();}catch(Throwable $e){return '<div class="trofy-alert">Ошибка подключения к заявкам.</div>'; }if(!$settings)return '<div class="trofy-alert">Не удалось загрузить настройки.</div>';if(!self::has_public_access()){$error=isset($_GET['login'])?'<div class="trofy-login-error">Неверный пароль.</div>':'';$redirect=self::applications_url($settings);return '<div class="trofy-login"><div class="trofy-login-icon">🔒</div><h2>Доступ к заявкам</h2><p>Введите пароль, чтобы посмотреть список экипажей.</p>'.$error.'<form action="'.esc_url(admin_url('admin-post.php')).'" method="post"><input type="hidden" name="action" value="trofy_public_login"><input type="hidden" name="redirect_to" value="'.esc_attr($redirect).'"><input type="hidden" name="season_id" value="'.(int)$settings['season_id'].'"><input type="hidden" name="event_id" value="'.(int)$settings['event_id'].'"><input type="password" name="password" placeholder="Пароль" autocomplete="current-password" required><button type="submit">Показать заявки</button></form></div>';}
+        $rows=self::get_applications((int)$settings['season_id'],(int)$settings['event_id']);ob_start();?><div class="trofy-public"><div class="trofy-public-head"><div><span>СПИСОК ЗАЯВОК</span><h2><?php echo esc_html($settings['event_name']); ?></h2><p><?php echo esc_html($settings['season_name']); ?></p></div><div class="trofy-public-actions"><a href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=trofy_export&scope=public&season_id='.(int)$settings['season_id'].'&event_id='.(int)$settings['event_id']),'trofy_export')); ?>">↓ Excel</a><a href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=trofy_public_logout&redirect_to='.rawurlencode(self::applications_url($settings))),'trofy_public_logout')); ?>">Выйти</a></div></div><div class="trofy-public-count">Всего экипажей: <strong><?php echo count($rows); ?></strong></div><div class="trofy-public-grid"><?php foreach($rows as $i=>$row): ?><article><div class="trofy-card-top"><span>#<?php echo $i+1; ?></span><b><?php echo esc_html($row['class']); ?></b></div><h3><?php echo esc_html($row['namePilot']); ?></h3><p><?php echo esc_html($row['nameShturman']); ?></p><div>🚙 <?php echo esc_html($row['car']); ?></div><div>📍 <?php echo esc_html($row['city']); ?></div><div>📞 <a href="tel:<?php echo esc_attr($row['tel']); ?>"><?php echo esc_html($row['tel']); ?></a></div></article><?php endforeach; ?></div></div><?php return ob_get_clean();
     }
 
-    public static function public_login(): void { $redirect=!empty($_POST['redirect_to'])?esc_url_raw(wp_unslash($_POST['redirect_to'])):self::applications_url();if(!wp_validate_redirect($redirect,self::applications_url()))$redirect=self::applications_url();try{$settings=self::settings();$password=isset($_POST['password'])?(string)wp_unslash($_POST['password']):'';if(!$settings||!$password)throw new RuntimeException();$stored=(string)$settings['pass'];$valid=wp_check_password($password,$stored);if(!$valid&&hash_equals($stored,$password)){$hash=wp_hash_password($password);$stmt=self::db()->prepare('UPDATE appsettings SET pass=? WHERE id=1');$stmt->bind_param('s',$hash);$stmt->execute();$valid=true;}if(!$valid)throw new RuntimeException();self::issue_public_access();self::redirect($redirect);}catch(Throwable $e){self::redirect($redirect,['login'=>'error']);} }
-    public static function public_logout(): void {if(isset($_REQUEST['_wpnonce']))check_admin_referer('trofy_public_logout');self::revoke_public_access();self::redirect(self::applications_url());}
+    public static function public_login(): void { $redirect=!empty($_POST['redirect_to'])?esc_url_raw(wp_unslash($_POST['redirect_to'])):self::applications_url();if(!wp_validate_redirect($redirect,self::applications_url()))$redirect=self::applications_url();try{$settings=self::settings();$password=isset($_POST['password'])?(string)wp_unslash($_POST['password']):'';if(!$settings||!$password)throw new RuntimeException();$stored=(string)$settings['pass'];$valid=wp_check_password($password,$stored);if(!$valid&&$stored!==''&&hash_equals($stored,$password)){$hash=wp_hash_password($password);$stmt=self::db()->prepare('UPDATE appsettings SET pass=? WHERE id=1');$stmt->bind_param('s',$hash);$stmt->execute();$valid=true;}if(!$valid)throw new RuntimeException();self::issue_public_access();self::redirect($redirect);}catch(Throwable $e){self::redirect($redirect,['login'=>'error']);} }
+    public static function public_logout(): void {if(isset($_REQUEST['_wpnonce']))check_admin_referer('trofy_public_logout');$redirect=!empty($_REQUEST['redirect_to'])?esc_url_raw(wp_unslash($_REQUEST['redirect_to'])):self::applications_url();if(!wp_validate_redirect($redirect,self::applications_url()))$redirect=self::applications_url();self::revoke_public_access();self::redirect($redirect);}
 
     public static function export_excel(): void {
         $is_admin=is_user_logged_in()&&current_user_can('manage_options');if($is_admin)check_admin_referer('trofy_export');elseif(!self::has_public_access())wp_die('Доступ запрещён.','Доступ запрещён',['response'=>403]);
