@@ -2,13 +2,13 @@
 /**
  * Plugin Name: Trofy AppForms
  * Description: Форма регистрации экипажей, защищённый список заявок и экспорт Excel.
- * Version: 2.0.3
+ * Version: 2.0.4
  * Author: Alex7r259
  */
 defined('ABSPATH') || exit;
 
 final class Trofy_AppForms {
-    private const VERSION = '2.0.3';
+    private const VERSION = '2.0.4';
     private const ACCESS_TTL = 28800;
     private const ACCESS_COOKIE = 'trofy_appforms_access';
     private static $db = null;
@@ -251,8 +251,13 @@ final class Trofy_AppForms {
     }
 
     private static function get_applications(int $season_id, int $event_id): array {
-        $st = self::db()->prepare("SELECT id,class,namePilot,nameShturman,city,car,tel,DATE_FORMAT(time,'%d.%m.%Y %H:%i') formatted_time FROM appparticipation WHERE season_id=? AND event_id=? ORDER BY time DESC");
-        $st->bind_param('ii', $season_id, $event_id);
+        $db = self::db();
+        $sql = "SELECT id,class,namePilot,nameShturman,city,car,tel,DATE_FORMAT(time,'%d.%m.%Y %H:%i') formatted_time
+                FROM appparticipation
+                WHERE event_id=? AND (season_id=? OR season_id IS NULL OR season_id=0)
+                ORDER BY time DESC";
+        $st = $db->prepare($sql);
+        $st->bind_param('ii', $event_id, $season_id);
         $st->execute();
         return $st->get_result()->fetch_all(MYSQLI_ASSOC);
     }
